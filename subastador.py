@@ -1,46 +1,51 @@
-import socket #se usara UDP por velocidad
+import socket
 import struct
-import threading #concurrencia
-import time
+import threading
 
 MULTICAST_GROUP = '224.1.1.1'
-MULTICAST_PORT = '5007'
-SERVER_PORT = '5008'
+MULTICAST_PORT = 5007
+SERVER_PORT = 5008
 
 precio_actual = 20.0
 mejor_postor = 'Ninguno'
-lock = threading.Lock() #Lock asegura que un solo hilo modifique los datos a la vez
+lock = threading.Lock()
 
 def escuchar_pujas():
     global precio_actual, mejor_postor
+
+    # Socket para recibir pujas de los clientes (Unicast)
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_socket.bind(('', SERVER_PORT))
-    print(f'n\Escuchando pujas en el puerto {SERVER_PORT}')
-    #Abre el puerto  mientras se escuchan las pujas no cierra
-    while True:
-        data, addr = server_socket.recvfrom(1024)
-        mensaje = data.decode('utf-8')
-        partes = mensaje.split(":")
-        cliente_id = partes[0]
-        ofertas = float(partes[1])
-        #comprueba si la puja es mayor que el precio actual y si es mayor la asigna como nuevo precio
-        with lock:
-            if ofertas > precio_actual:
-                mejor_postor = cliente_id
-                precio_actual = ofertas
-                print(f"n\Puja aceptada: '{mejor_postor}' pujo '{precio_actual}f'!")
-            else:
-                print('Puja rechazada :(')
-def transmitir_estado():
-    global precio_actual, mejor_postor
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    ttl = struct.pack('b', 1) #significa que el paquete solo viaja localmente
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+    # Socket para enviar la actualización por Multicast cuando ocurra un cambio
+    sock_multicast = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    ttl = struct.pack('b', 1) # Solo viaja localmente / red virtual
+    sock_multicast.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+
+    print(f'Servidor listo. Escuchando pujas en el puerto {SERVER_PORT}...')
 
     while True:
-        with lock:
-            mensaje = f"ESTADO_SUBASTA|Precio actual: {precio_actual}, mejor postor: {mejor_postor}"
+        try:
+            data, addr = server_socket.recvfrom(1024)
+            mensaje = data.decode('utf-8')
+            partes = mensaje.split(":")
+            cliente_id = partes[0]
+            ofertas = float(partes[1])
 
-        sock.sendto(mensaje.encode('utf-8'), (MULTICAST_GROUP ,MULTICAST_PORT))
-        time.sleep(2) #se actualiza cada 2 segundos
+            with lock:
+                if ofertas > precio_actual:
+                    mejor_postor = cliente_id
+                    precio_actual = ofertas
+                    print(f"\n¡Nueva puja aceptada! Postor: {mejor_postor} | Cantidad: ${precio_actual}")
+
+                    # ENVIAR MULTICAST INMEDIATAMENTE AL CAMBIAR EL ESTADO
+                    mensaje_multicast = f"ESTADO_SUBASTA|Precio actual: ${precio_actual}, mejor postor: {mejor_postor}"
+                    sock_multicast.sendto(mensaje_multicast.encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
+                else:
+                    print(f"\nPuja rechazada de {cliente_id} (${ofertas}): Es menor o igual al precio actual (${precio_actual}).")
+        except Exception as e:
+            print(f"[Error recibiendo puja]: {e}")
+
+if __name__ == "__main__":
+    # Ya no necesitamos el hilo de transmisión periódica, todo se maneja por eventos en el servidor
+    escuchar_pujas()
