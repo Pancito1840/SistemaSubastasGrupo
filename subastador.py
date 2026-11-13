@@ -1,51 +1,80 @@
+import math
 import socket
-import struct
-import threading
+import time
 
-MULTICAST_GROUP = '224.1.1.1'
-MULTICAST_PORT = 5007
 SERVER_PORT = 5008
-
+# Escucha en todas las interfaces, incluida la interfaz de Hamachi.
+BIND_IP = '0.0.0.0'
+CLIENT_TIMEOUT = 30
 precio_actual = 20.0
 mejor_postor = 'Ninguno'
-lock = threading.Lock()
 
-def escuchar_pujas():
+
+def estado():
+    return f'ESTADO_SUBASTA|Precio actual: ${precio_actual:.2f}, mejor postor: {mejor_postor}'
+
+
+def main():
     global precio_actual, mejor_postor
+    clientes = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as servidor:
+        servidor.bind((BIND_IP, SERVER_PORT))
+        print(f'Servidor UDP escuchando en el puerto {SERVER_PORT} (todas las interfaces).')
+        print(estado())
 
-    # Socket para recibir pujas de los clientes (Unicast)
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_socket.bind(('', SERVER_PORT))
+        def enviar(mensaje, destino):
+            try:
+                servidor.sendto(mensaje.encode('utf-8'), destino)
+            except OSError as exc:
+                print(f'No se pudo enviar una actualización: {exc}')
 
-    # Socket para enviar la actualización por Multicast cuando ocurra un cambio
-    sock_multicast = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    ttl = struct.pack('b', 1) # Solo viaja localmente / red virtual
-    sock_multicast.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+        while True:
+            data, addr = servidor.recvfrom(2048)
+            try:
+                mensaje = data.decode('utf-8').strip()
+                if mensaje == 'SALIR':
+                    clientes.pop(addr, None)
+                    continue
+                if mensaje == 'ESTADO':
+                    clientes[addr] = time.monotonic()
+                    enviar(estado(), addr)
+                    continue
+                nombre, cantidad = mensaje.split(':', 1)
+                nombre = nombre.strip()
+                if not nombre or len(nombre) > 40 or any(c in nombre for c in '|:\n\r'):
+                    raise ValueError('Nombre de postor inválido')
+                oferta = float(cantidad)
+                if not math.isfinite(oferta) or oferta <= 0:
+                    raise ValueError('La oferta debe ser un número positivo y finito')
+                clientes[addr] = time.monotonic()
+                if oferta <= precio_actual:
+                    respuesta = f'RECHAZADA|Tu oferta ${oferta:.2f} debe superar ${precio_actual:.2f}'
+                    enviar(respuesta, addr)
+                    enviar(estado(), addr)
+                    print(f'Oferta rechazada: {nombre} (${oferta:.2f})')
+                    continue
+                precio_actual, mejor_postor = oferta, nombre
+                respuesta = f'ACEPTADA|Tu oferta de ${oferta:.2f} fue aceptada'
+                enviar(respuesta, addr)
+                print(f'Nueva oferta: {nombre} (${oferta:.2f})')
+                print(estado())
+                # Un fallo al enviar a un cliente no impide actualizar a los demás.
+                ahora = time.monotonic()
+                for cliente, ultima_consulta in list(clientes.items()):
+                    if ahora - ultima_consulta > CLIENT_TIMEOUT:
+                        clientes.pop(cliente, None)
+                    else:
+                        enviar(estado(), cliente)
+            except (UnicodeError, ValueError) as exc:
+                enviar(f'ERROR|{exc}', addr)
+                print(f'Mensaje inválido desde {addr}: {exc}')
 
-    print(f'Servidor listo. Escuchando pujas en el puerto {SERVER_PORT}...')
 
-    while True:
-        try:
-            data, addr = server_socket.recvfrom(1024)
-            mensaje = data.decode('utf-8')
-            partes = mensaje.split(":")
-            cliente_id = partes[0]
-            ofertas = float(partes[1])
-
-            with lock:
-                if ofertas > precio_actual:
-                    mejor_postor = cliente_id
-                    precio_actual = ofertas
-                    print(f"\n¡Nueva puja aceptada! Postor: {mejor_postor} | Cantidad: ${precio_actual}")
-
-                    # ENVIAR MULTICAST INMEDIATAMENTE AL CAMBIAR EL ESTADO
-                    mensaje_multicast = f"ESTADO_SUBASTA|Precio actual: ${precio_actual}, mejor postor: {mejor_postor}"
-                    sock_multicast.sendto(mensaje_multicast.encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
-                else:
-                    print(f"\nPuja rechazada de {cliente_id} (${ofertas}): Es menor o igual al precio actual (${precio_actual}).")
-        except Exception as e:
-            print(f"[Error recibiendo puja]: {e}")
-
-if __name__ == "__main__":
-    # Ya no necesitamos el hilo de transmisión periódica, todo se maneja por eventos en el servidor
-    escuchar_pujas()
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\nServidor detenido.')
+    except OSError as exc:
+        print(f'No se pudo iniciar el servidor: {exc}')
+        print(f'Comprueba que el puerto UDP {SERVER_PORT} esté disponible.')
